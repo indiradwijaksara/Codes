@@ -1,0 +1,100 @@
+import pandas as pd
+import json
+import numpy as np
+import tensorflow as tf
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Dense
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.metrics import confusion_matrix, classification_report
+import matplotlib.pyplot as plt
+
+with open("data.json", "r") as f:
+    data = json.load(f)
+
+df = pd.DataFrame(data)
+
+df['timestamp'] = df['timestamp'].apply(lambda x: x['$date'] if isinstance(x, dict) else x)
+df['timestamp'] = pd.to_datetime(df['timestamp'])
+df['time_group'] = df['timestamp'].dt.floor('s')
+
+pivot_df = df.pivot_table(index='time_group', columns='sensor_name', values='value', aggfunc='max', fill_value=0)
+pivot_df = pivot_df.astype(float)
+
+X = pivot_df.values
+scaler = MinMaxScaler()
+X_scaled = scaler.fit_transform(X)
+
+X_train, X_val = train_test_split(X_scaled, test_size=0.2, random_state=42)
+
+input_dim = X_train.shape[1]
+autoencoder = Sequential([
+    Dense(16, activation='relu', input_shape=(input_dim,)),
+    Dense(8, activation='relu'),
+    Dense(16, activation='relu'),
+    Dense(input_dim, activation='linear')
+])
+autoencoder.compile(optimizer='adam', loss='mse')
+
+history = autoencoder.fit(X_train, X_train,
+                          epochs=100,
+                          batch_size=32,
+                          validation_data=(X_val, X_val),
+                          verbose=2)
+
+autoencoder.save("normal_model.h5")
+
+converter = tf.lite.TFLiteConverter.from_keras_model(autoencoder)
+tflite_model = converter.convert()
+with open("normal_model.tflite", "wb") as f:
+    f.write(tflite_model)
+
+X_pred = autoencoder.predict(X_scaled)
+mse_errors = np.mean((X_scaled - X_pred)**2, axis=1)
+threshold = np.percentile(mse_errors, 95)
+anomaly_mask = mse_errors > threshold
+
+print(f"\n--- Reconstruction Error Summary ---")
+print(f"Mean: {np.mean(mse_errors):.6f}")
+print(f"Std: {np.std(mse_errors):.6f}")
+print(f"Min: {np.min(mse_errors):.6f}")
+print(f"Max: {np.max(mse_errors):.6f}")
+print(f"Threshold (95th percentile): {threshold:.6f}")
+print(f"Detected {np.sum(anomaly_mask)} anomalies out of {len(mse_errors)} samples.")
+
+y_true = np.zeros(len(mse_errors), dtype=int)
+y_pred = anomaly_mask.astype(int)
+
+cm = confusion_matrix(y_true, y_pred)
+print("\n--- Confusion Matrix ---")
+print(cm)
+
+print("\n--- Classification Report ---")
+print(classification_report(y_true, y_pred))
+
+pivot_df['reconstruction_error'] = mse_errors
+pivot_df['anomaly'] = anomaly_mask
+pivot_df.to_csv("normal_data_with_anomaly.csv")
+print("\nSaved to normal_data_with_anomaly.csv")
+
+plt.figure(figsize=(10, 4))
+plt.hist(mse_errors, bins=50, color='skyblue', edgecolor='black')
+plt.axvline(threshold, color='red', linestyle='--', label='Threshold (95th)')
+plt.title("Histogram of Reconstruction Errors")
+plt.xlabel("Reconstruction Error (MSE)")
+plt.ylabel("Frequency")
+plt.legend()
+plt.tight_layout()
+plt.show()
+
+plt.figure(figsize=(12, 5))
+plt.plot(mse_errors, marker='.', label='Reconstruction Error', alpha=0.6)
+plt.axhline(threshold, color='red', linestyle='--', label='Threshold')
+plt.scatter(np.where(anomaly_mask)[0], mse_errors[anomaly_mask], color='red', label='Anomaly')
+plt.xlabel("Index")
+plt.ylabel("MSE")
+plt.legend()
+plt.title("Reconstruction Error with Anomaly Marking")
+plt.grid(True)
+plt.tight_layout()
+plt.show()

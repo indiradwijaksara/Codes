@@ -1,0 +1,151 @@
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include <Wire.h>
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
+#include <DHT.h>
+
+const char* ssid = "indihome";
+const char* password = "55556666";
+const char* mqtt_server = "192.168.132.128"; 
+
+WiFiClient espClient;
+PubSubClient client(espClient);
+
+#define FLOAT_SWITCH_PIN 12
+#define DHT22_PIN 25
+#define ACS712_PIN 34
+#define SDA_PIN 32
+#define SCL_PIN 33
+
+DHT dht22(DHT22_PIN, DHT22);
+Adafruit_MPU6050 mpu;
+
+float vibrationThreshold = 0;
+bool calibrated = false;
+
+const float ACS712_SENSITIVITY = 0.185;
+const float ACS712_OFFSET = 1.65;
+
+unsigned long lastPrint = 0;
+unsigned long printInterval = 2000;
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  pinMode(FLOAT_SWITCH_PIN, INPUT_PULLUP);
+  dht22.begin();
+  Wire.begin(SDA_PIN, SCL_PIN);
+
+  if (!mpu.begin()) {
+    Serial.println("MPU6050 not detected!");
+    while (1) delay(10);
+  }
+
+  calibrateVibrationThreshold();
+  analogReadResolution(12);
+
+  WiFi.begin(ssid, password);
+  Serial.print("Connecting to WiFi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\n[✓] WiFi connected");
+  
+  Serial.print("[i] ESP32 IP Address: ");
+  Serial.println(WiFi.localIP());
+
+  client.setServer(mqtt_server, 1883);
+}
+
+void loop() {
+  if (!client.connected()) {
+    reconnectMQTT();
+  }
+  client.loop();
+
+  unsigned long currentMillis = millis();
+  if (currentMillis - lastPrint >= printInterval) {
+    lastPrint = currentMillis;
+
+    // === Float Switch ===
+    int floatState = digitalRead(FLOAT_SWITCH_PIN);
+    int floatBinary = (floatState == LOW) ? 1 : 0;
+    if(client.publish("sensors/float", String(floatBinary).c_str())) {
+      Serial.printf("[MQTT] Published float: %d\n", floatBinary);
+    } else {
+      Serial.println("[MQTT] Failed publish float");
+    }
+
+    float vibration = getVibrationMagnitude();
+    if(client.publish("sensors/vibration", String(vibration, 4).c_str())) {
+      Serial.printf("[MQTT] Published vibration: %.4f\n", vibration);
+    } else {
+      Serial.println("[MQTT] Failed publish vibration");
+    }
+
+    int rawValue = analogRead(ACS712_PIN);
+    float voltage = (rawValue / 4095.0) * 3.3;
+    float current = (voltage - ACS712_OFFSET) / ACS712_SENSITIVITY;
+    if(client.publish("sensors/current", String(current, 3).c_str())) {
+      Serial.printf("[MQTT] Published current: %.3f\n", current);
+    } else {
+      Serial.println("[MQTT] Failed publish current");
+    }
+
+    float humi = dht22.readHumidity();
+    float tempC = dht22.readTemperature();
+
+    if (!isnan(humi) && !isnan(tempC)) {
+      if(client.publish("sensors/humidity", String(humi, 1).c_str()) &&
+         client.publish("sensors/temp_dht22", String(tempC, 1).c_str())) {
+        Serial.printf("[MQTT] Published humidity: %.1f, temperature: %.1f\n", humi, tempC);
+      } else {
+        Serial.println("[MQTT] Failed publish humidity or temperature");
+      }
+    } else {
+      client.publish("sensors/humidity", "-1");
+      client.publish("sensors/temp_dht22", "-1");
+      Serial.println("[MQTT] Published invalid humidity/temp: -1");
+    }
+  }
+}
+
+float getVibrationMagnitude() {
+  sensors_event_t a, g, temp;
+  mpu.getEvent(&a, &g, &temp);
+  return sqrt(a.acceleration.x * a.acceleration.x +
+              a.acceleration.y * a.acceleration.y +
+              a.acceleration.z * a.acceleration.z);
+}
+
+void calibrateVibrationThreshold() {
+  const int samples = 100;
+  float sum = 0, sumSq = 0;
+  for (int i = 0; i < samples; i++) {
+    float mag = getVibrationMagnitude();
+    sum += mag;
+    sumSq += mag * mag;
+    delay(50);
+  }
+  float mean = sum / samples;
+  float stddev = sqrt(sumSq / samples - mean * mean);
+  vibrationThreshold = mean + 2 * stddev;
+  calibrated = true;
+}
+
+void reconnectMQTT() {
+  while (!client.connected()) {
+    Serial.print("Connecting to MQTT...");
+    if (client.connect("ESP32Client")) {
+      Serial.println("connected.");
+    } else {
+      Serial.print("failed, rc=");
+      Serial.print(client.state());
+      Serial.println(" trying again in 5s");
+      delay(5000);
+    }
+  }
+}

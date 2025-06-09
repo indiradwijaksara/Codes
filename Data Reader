@@ -1,0 +1,62 @@
+import paho.mqtt.client as mqtt
+from pymongo import MongoClient
+from datetime import datetime
+
+mongo_client = MongoClient("mongodb://localhost:27017/")
+db = mongo_client["database"]
+collection = db["sensor"]
+
+MQTT_BROKER_IP = "192.168.132.128"
+MQTT_PORT = 1883
+
+def is_float(value):
+    try:
+        float(value)
+        return True
+    except:
+        return False
+
+def on_connect(client, userdata, flags, rc):
+    if rc == 0:
+        print("[*] Connected to MQTT broker!")
+        topics = [
+            "sensors/vibration",
+            "sensors/current",
+            "sensors/humidity",
+            "sensors/temp_dht22",
+            "sensors/float"
+        ]
+        for topic in topics:
+            client.subscribe(topic)
+            print(f"[*] Subscribed to {topic}")
+    else:
+        print(f"[!] Failed to connect, return code {rc}")
+
+def on_message(client, userdata, msg):
+    try:
+        payload = msg.payload.decode()
+        print(f"[MQTT] Received: {msg.topic} -> {payload}")
+
+        data = {
+            "timestamp": datetime.utcnow(),
+            "topic": msg.topic,
+            "sensor_name": msg.topic.split("/")[-1],
+            "value": float(payload) if is_float(payload) else payload
+        }
+
+        collection.insert_one(data)
+        print(f"[✓] Data inserted: {data}")
+
+    except Exception as e:
+        print(f"[!] Error inserting data: {str(e)}")
+
+def main():
+    print(f"[*] Connecting to MQTT broker at {MQTT_BROKER_IP}:{MQTT_PORT}...")
+    mqtt_client = mqtt.Client(protocol=mqtt.MQTTv311)
+    mqtt_client.on_connect = on_connect
+    mqtt_client.on_message = on_message
+    mqtt_client.connect(MQTT_BROKER_IP, MQTT_PORT)
+    mqtt_client.loop_forever()
+
+if __name__ == "__main__":
+    main()
